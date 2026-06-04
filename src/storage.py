@@ -20,7 +20,7 @@ import re
 import threading
 import time
 from datetime import datetime, date, timedelta
-from typing import Optional, List, Dict, Any, TYPE_CHECKING, Tuple, Callable, TypeVar
+from typing import Optional, List, Dict, Any, TYPE_CHECKING, Tuple, Callable, TypeVar, Union
 
 import pandas as pd
 from sqlalchemy import (
@@ -36,6 +36,7 @@ from sqlalchemy import (
     Index,
     UniqueConstraint,
     Text,
+    case,
     select,
     and_,
     or_,
@@ -1511,7 +1512,7 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
     
     def get_analysis_history_paginated(
         self,
-        code: Optional[str] = None,
+        code: Optional[Union[str, List[str]]] = None,
         start_date: Optional[date] = None,
         end_date: Optional[date] = None,
         offset: int = 0,
@@ -1536,7 +1537,12 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
             conditions = []
             
             if code:
-                conditions.append(AnalysisHistory.code == code)
+                if isinstance(code, list):
+                    codes = [c for c in code if c]
+                    if codes:
+                        conditions.append(AnalysisHistory.code.in_(codes))
+                else:
+                    conditions.append(AnalysisHistory.code == code)
             if start_date:
                 # created_at >= start_date 00:00:00
                 conditions.append(AnalysisHistory.created_at >= datetime.combine(start_date, datetime.min.time()))
@@ -1606,6 +1612,61 @@ class DatabaseManager(metaclass=_DatabaseManagerMeta):
                 delete(AnalysisHistory).where(AnalysisHistory.id.in_(ids))
             )
             return result.rowcount or 0
+
+    def get_distinct_stocks_from_history(
+        self,
+        start_date: Optional[date] = None,
+        end_date: Optional[date] = None,
+        limit: int = 200,
+    ) -> List[AnalysisHistory]:
+        """
+        获取历史记录中的不重复股票列表，每只股票取最新一条记录。
+
+        使用子查询按 code 分组取 MAX(id)，再 JOIN 回查完整记录。
+        大盘复盘（code="MARKET"）始终排在最前。
+
+        Args:
+            start_date: 开始日期
+            end_date: 结束日期
+            limit: 最大返回数量
+
+        Returns:
+            每条股票最新一条 AnalysisHistory 记录列表
+        """
+        with self.get_session() as session:
+            subq = (
+                select(
+                    AnalysisHistory.code,
+                    func.max(AnalysisHistory.id).label("max_id"),
+                )
+            )
+            if start_date:
+                subq = subq.where(
+                    AnalysisHistory.created_at >= datetime.combine(start_date, datetime.min.time())
+                )
+            if end_date:
+                subq = subq.where(
+                    AnalysisHistory.created_at < datetime.combine(end_date + timedelta(days=1), datetime.min.time())
+                )
+            subq = subq.group_by(AnalysisHistory.code).subquery()
+
+            results = (
+                session.execute(
+                    select(AnalysisHistory)
+                    .join(subq, AnalysisHistory.id == subq.c.max_id)
+                    .order_by(
+                        case(
+                            (AnalysisHistory.code == "MARKET", 0),
+                            else_=1,
+                        ),
+                        desc(AnalysisHistory.created_at),
+                    )
+                    .limit(limit)
+                )
+                .scalars()
+                .all()
+            )
+            return list(results)
 
     def get_latest_analysis_by_query_id(self, query_id: str) -> Optional[AnalysisHistory]:
         """

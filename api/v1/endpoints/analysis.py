@@ -62,6 +62,11 @@ from src.core.market_review_lock import (
 from src.core.market_review_runtime import (
     build_market_review_runtime as _runtime_build_market_review_runtime,
 )
+from src.analysis_context_pack_overview import (
+    extract_analysis_context_pack_overview,
+    sanitize_context_snapshot_for_api,
+)
+from src.market_phase_summary import extract_market_phase_summary, render_market_phase_summary
 from src.report_language import get_localized_stock_name, normalize_report_language
 from src.services.name_to_code_resolver import resolve_name_to_code
 from src.services.stock_code_utils import is_code_like
@@ -143,12 +148,18 @@ def _run_market_review_background(
             "search_service": search_service,
             "send_notification": send_notification,
             "override_region": override_region,
+            "return_structured": True,
         }
         if query_id:
             review_kwargs["query_id"] = query_id
         report = run_market_review(**review_kwargs)
         if not report:
             raise RuntimeError("大盘复盘未返回可持久化报告")
+        if hasattr(report, "report"):
+            return {
+                "result": report.report,
+                "market_review_payload": getattr(report, "market_review_payload", None),
+            }
         return {"result": report}
     finally:
         _release_market_review_lock(lock_token)
@@ -337,6 +348,7 @@ def _handle_async_analysis_batch(
     selection_source = request.selection_source if (is_single or preserve_batch_metadata) else None
     notify = getattr(request, "notify", True)
     skills = getattr(request, "skills", None)
+    analysis_phase = request.analysis_phase
 
     submit_kwargs = dict(
         stock_codes=stock_codes,
@@ -344,6 +356,7 @@ def _handle_async_analysis_batch(
         original_query=original_query,
         selection_source=selection_source,
         report_type=request.report_type,
+        analysis_phase=analysis_phase,
         force_refresh=request.force_refresh,
         notify=notify,
     )
@@ -359,6 +372,7 @@ def _handle_async_analysis_batch(
             stock_code=task.stock_code,
             status="pending",
             message=f"分析任务已加入队列: {task.stock_code}",
+            analysis_phase=task.analysis_phase,
         )
         for task in accepted_tasks
     ]
@@ -392,6 +406,7 @@ def _handle_async_analysis_batch(
             trace_id=accepted[0].trace_id,
             status="pending",
             message=accepted[0].message,
+            analysis_phase=accepted[0].analysis_phase,
         )
         return JSONResponse(
             status_code=202,
@@ -433,6 +448,7 @@ def _handle_sync_analysis(
             query_id=query_id,
             send_notification=getattr(request, "notify", True),
             skills=getattr(request, "skills", None),
+            analysis_phase=request.analysis_phase,
         )
 
         if result is None:
@@ -613,6 +629,8 @@ def get_task_list(
             error=t.error,
             original_query=t.original_query,
             selection_source=t.selection_source,
+            analysis_phase=t.analysis_phase,
+            skills=getattr(t, "skills", None),
         )
         for t in all_tasks
     ]
@@ -837,12 +855,16 @@ def get_analysis_status(task_id: str) -> TaskStatus:
     if task:
         result: Optional[AnalysisResultResponse] = None
         market_review_report = None
+        market_review_payload = None
 
         if task.status == TaskStatusEnum.COMPLETED and isinstance(task.result, dict):
             if task.stock_code == "market_review":
                 report_text = task.result.get("result")
                 if isinstance(report_text, str) and report_text.strip():
                     market_review_report = report_text
+                payload = task.result.get("market_review_payload")
+                if isinstance(payload, dict):
+                    market_review_payload = payload
             else:
                 try:
                     result = _build_task_analysis_result(task)
@@ -859,10 +881,12 @@ def get_analysis_status(task_id: str) -> TaskStatus:
             progress=task.progress,
             result=result,
             market_review_report=market_review_report,
+            market_review_payload=market_review_payload,
             error=task.error,
             stock_name=task.stock_name,
             original_query=task.original_query,
             selection_source=task.selection_source,
+            analysis_phase=task.analysis_phase,
             skills=getattr(task, "skills", None),
         )
     
@@ -877,6 +901,12 @@ def get_analysis_status(task_id: str) -> TaskStatus:
             raw_result = parse_json_field(record.raw_result)
             if getattr(record, "report_type", None) == "market_review":
                 market_review_report = None
+                context_snapshot = parse_json_field(getattr(record, "context_snapshot", None))
+                market_review_payload = None
+                if isinstance(context_snapshot, dict):
+                    payload = context_snapshot.get("market_review_payload")
+                    if isinstance(payload, dict):
+                        market_review_payload = payload
                 if isinstance(raw_result, dict):
                     report_text = raw_result.get("raw_response") or raw_result.get("market_review_report")
                     if isinstance(report_text, str) and report_text.strip():
@@ -891,6 +921,7 @@ def get_analysis_status(task_id: str) -> TaskStatus:
                     progress=100,
                     result=None,
                     market_review_report=market_review_report,
+                    market_review_payload=market_review_payload,
                     error=None,
                     stock_name=record.name,
                 )
@@ -906,6 +937,9 @@ def get_analysis_status(task_id: str) -> TaskStatus:
             # Extract current_price / change_pct from context_snapshot
             skills = None
             context_snapshot = parse_json_field(getattr(record, 'context_snapshot', None))
+            analysis_context_pack_overview = extract_analysis_context_pack_overview(context_snapshot)
+            market_phase_summary = extract_market_phase_summary(context_snapshot)
+            api_context_snapshot = sanitize_context_snapshot_for_api(context_snapshot)
             if context_snapshot and isinstance(context_snapshot, dict):
                 raw_skills = context_snapshot.get("skills")
                 if isinstance(raw_skills, list):
@@ -927,11 +961,12 @@ def get_analysis_status(task_id: str) -> TaskStatus:
             )
             has_board_details = bool(extracted_boards.get("belong_boards")) or extracted_boards.get("sector_rankings") is not None
             details = None
-            if any(extracted_fundamental.values()) or has_board_details or context_snapshot is not None:
+            if any(extracted_fundamental.values()) or has_board_details or context_snapshot is not None or analysis_context_pack_overview is not None:
                 details = ReportDetails(
                     news_content=getattr(record, "news_content", None),
                     raw_result=raw_result,
-                    context_snapshot=context_snapshot,
+                    context_snapshot=api_context_snapshot,
+                    analysis_context_pack_overview=analysis_context_pack_overview,
                     financial_report=extracted_fundamental.get("financial_report"),
                     dividend_metrics=extracted_fundamental.get("dividend_metrics"),
                     belong_boards=extracted_boards.get("belong_boards"),
@@ -951,6 +986,7 @@ def get_analysis_status(task_id: str) -> TaskStatus:
                     model_used=model_used,
                     current_price=current_price,
                     change_pct=change_pct,
+                    market_phase_summary=market_phase_summary,
                 ),
                 summary=ReportSummary(
                     sentiment_score=record.sentiment_score,
@@ -1096,6 +1132,11 @@ def _build_analysis_report(
     change_pct = meta_data.get("change_pct")
     if change_pct is None:
         change_pct = realtime_fields.get("change_pct")
+    market_phase_summary = extract_market_phase_summary(context_snapshot)
+    if market_phase_summary is None:
+        meta_phase_summary = meta_data.get("market_phase_summary")
+        if meta_phase_summary is not None:
+            market_phase_summary = render_market_phase_summary(meta_phase_summary)
 
     meta = ReportMeta(
         query_id=meta_data.get("query_id", query_id),
@@ -1107,6 +1148,7 @@ def _build_analysis_report(
         current_price=current_price,
         change_pct=change_pct,
         model_used=normalize_model_used(meta_data.get("model_used")),
+        market_phase_summary=market_phase_summary,
     )
 
     summary = ReportSummary(
@@ -1134,13 +1176,16 @@ def _build_analysis_report(
         context_snapshot=context_snapshot,
         fallback_fundamental_payload=fallback_fundamental_payload,
     )
+    analysis_context_pack_overview = extract_analysis_context_pack_overview(context_snapshot)
+    api_context_snapshot = sanitize_context_snapshot_for_api(context_snapshot)
     details = None
     has_board_details = bool(extracted_boards.get("belong_boards")) or extracted_boards.get("sector_rankings") is not None
-    if details_data or any(extracted_fundamental.values()) or has_board_details or context_snapshot is not None:
+    if details_data or any(extracted_fundamental.values()) or has_board_details or context_snapshot is not None or analysis_context_pack_overview is not None:
         details = ReportDetails(
             news_content=details_data.get("news_summary") or details_data.get("news_content"),
             raw_result=details_data,
-            context_snapshot=context_snapshot,
+            context_snapshot=api_context_snapshot,
+            analysis_context_pack_overview=analysis_context_pack_overview,
             financial_report=extracted_fundamental.get("financial_report"),
             dividend_metrics=extracted_fundamental.get("dividend_metrics"),
             belong_boards=extracted_boards.get("belong_boards"),
