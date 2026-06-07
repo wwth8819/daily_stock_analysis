@@ -21,10 +21,12 @@ export interface AnalysisRequest {
   selectionSource?: 'manual' | 'autocomplete' | 'import' | 'image';
   notify?: boolean;
   skills?: string[];
+  reportLanguage?: ReportLanguage;
 }
 
 export interface MarketReviewRequest {
   sendNotification?: boolean;
+  reportLanguage?: ReportLanguage;
 }
 
 export interface MarketReviewAccepted {
@@ -441,6 +443,7 @@ export interface NewsIntelResponse {
 /** History filter parameters */
 export interface HistoryFilters {
   stockCode?: string;
+  reportType?: ReportType;
   startDate?: string;
   endDate?: string;
 }
