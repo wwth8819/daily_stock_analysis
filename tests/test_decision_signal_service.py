@@ -267,6 +267,13 @@ def test_list_signals_lazily_backfills_analysis_history_signal(isolated_db) -> N
     assert item["reason"] == "趋势仍在，但等待量能确认。"
     assert item["watch_conditions"] == '["回踩不破支撑"]'
     assert item["status"] == "expired"
+    assert item["metadata"]["decision_profile"] == "balanced"
+    assert item["metadata"]["profile_source"] == "backfill_defaulted"
+    assert item["metadata"]["profile_policy_version"] == "decision-profile-v1"
+    assert item["metadata"]["signal_generation_version"] == "legacy-report-extractor-v1"
+    assert item["metadata"]["decision_signal_metadata_version"] == "decision-signal-metadata-v1"
+    assert "scoring_version" not in item["metadata"]
+    assert "scoring_breakdown" not in item["metadata"]
     assert datetime.fromisoformat(item["created_at"]) == expected_created_at
 
     listed_again = service.list_signals(source_type="analysis", source_report_id=record_id)
@@ -490,6 +497,84 @@ def test_list_signals_does_not_backfill_ambiguous_history_default_decision_type_
 
     assert listed["total"] == 0
     assert listed["items"] == []
+    with isolated_db.get_session() as session:
+        assert session.query(DecisionSignalRecord).count() == 0
+
+
+def test_list_signals_explicit_stock_identities_override_holding_only_and_intersect_filters(isolated_db) -> None:
+    service = DecisionSignalService(db_manager=isolated_db)
+    service.create_signal(
+        _payload(
+            source_report_id=171501,
+            trace_id="trace-explicit-identity-000001",
+            stock_code="000001",
+            stock_name="平安银行",
+            action="sell",
+        )
+    )
+    service.create_signal(
+        _payload(
+            source_report_id=171502,
+            trace_id="trace-explicit-identity-600519",
+            stock_code="600519",
+            action="reduce",
+        )
+    )
+
+    listed = service.list_signals(
+        stock_identities=[("cn", "000001")],
+        holding_only=True,
+        status="active",
+    )
+
+    assert listed["total"] == 1
+    assert listed["items"][0]["stock_code"] == "000001"
+    assert listed["items"][0]["action"] == "sell"
+
+    mismatched_stock_filter = service.list_signals(
+        stock_code="600519",
+        market="cn",
+        stock_identities=[("cn", "000001")],
+        status="active",
+    )
+
+    assert mismatched_stock_filter == {"items": [], "total": 0, "page": 1, "page_size": 20}
+
+
+def test_list_signals_explicit_empty_stock_identities_returns_empty_without_widening(isolated_db) -> None:
+    service = DecisionSignalService(db_manager=isolated_db)
+    service.create_signal(
+        _payload(
+            source_report_id=171503,
+            trace_id="trace-empty-identity-600519",
+            stock_code="600519",
+            action="sell",
+        )
+    )
+
+    listed = service.list_signals(stock_identities=[], status="active")
+
+    assert listed == {"items": [], "total": 0, "page": 1, "page_size": 20}
+
+
+def test_list_signals_explicit_stock_identities_do_not_trigger_history_backfill(isolated_db) -> None:
+    record_id = isolated_db.save_analysis_history(
+        result=_history_result(operation_advice="卖出", decision_type="sell", action="sell", action_label="卖出"),
+        query_id="query-explicit-identity-no-backfill",
+        report_type="simple",
+        news_content="新闻摘要",
+        context_snapshot={"market_phase_summary": {"phase": "postmarket"}},
+        save_snapshot=True,
+    )
+    service = DecisionSignalService(db_manager=isolated_db)
+
+    listed = service.list_signals(
+        source_type="analysis",
+        source_report_id=record_id,
+        stock_identities=[("cn", "600519")],
+    )
+
+    assert listed == {"items": [], "total": 0, "page": 1, "page_size": 20}
     with isolated_db.get_session() as session:
         assert session.query(DecisionSignalRecord).count() == 0
 
@@ -793,6 +878,11 @@ def test_service_sanitizes_text_and_json_before_persisting(isolated_db) -> None:
                 "auth_header": "Authorization: Basic dXNlcjpwYXNz",
                 "cookie_header": "Cookie: session=abc123",
             },
+            data_quality_summary={
+                "level": "limited",
+                "email_password": "mail-secret",
+                "note": "password=mail-secret-2",
+            },
             metadata={
                 "access_token": "abc",
                 "callback": "https://example.com/cb",
@@ -822,6 +912,8 @@ def test_service_sanitizes_text_and_json_before_persisting(isolated_db) -> None:
     assert "dXNlcjpwYXNz" not in response_blob
     assert "pwYXNz" not in response_blob
     assert "session=abc123" not in response_blob
+    assert "mail-secret" not in response_blob
+    assert "mail-secret-2" not in response_blob
     assert "secret-value" not in response_blob
     assert "sk-1234567890abcdef123456" not in response_blob
     assert "[REDACTED" in response_blob
@@ -836,6 +928,7 @@ def test_service_sanitizes_text_and_json_before_persisting(isolated_db) -> None:
                 row.invalidation,
                 row.watch_conditions,
                 row.evidence_json,
+                row.data_quality_summary_json,
                 row.metadata_json,
             )
         )
@@ -855,6 +948,8 @@ def test_service_sanitizes_text_and_json_before_persisting(isolated_db) -> None:
     assert "dXNlcjpwYXNz" not in stored_blob
     assert "pwYXNz" not in stored_blob
     assert "session=abc123" not in stored_blob
+    assert "mail-secret" not in stored_blob
+    assert "mail-secret-2" not in stored_blob
     assert "secret-value" not in stored_blob
     assert "sk-1234567890abcdef123456" not in stored_blob
 

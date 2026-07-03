@@ -51,6 +51,7 @@ import type {
 } from '../types/portfolio';
 import { areStockCodesEquivalent, normalizeStockCode } from '../utils/stockCode';
 import { parseDecisionSignalDate } from '../utils/decisionSignalTime';
+import { buildDecisionActionLabelMap, getDecisionActionLabel } from '../utils/decisionAction';
 
 const PIE_COLORS = ['#00d4ff', '#00ff88', '#ffaa00', '#ff7a45', '#7f8cff', '#ff4466'];
 const DEFAULT_PAGE_SIZE = 20;
@@ -77,6 +78,23 @@ type PortfolioSignalLookup = {
 type PortfolioSignalLookupResult = {
   items: DecisionSignalItem[];
   error: string | null;
+};
+
+type PortfolioPageLanguage = 'zh' | 'en';
+
+const PORTFOLIO_LIMITATION_LABELS: Record<string, Record<PortfolioPageLanguage, string>> = {
+  realtime_quote_best_effort: {
+    zh: '实时行情为尽力获取',
+    en: 'Realtime quotes are best-effort',
+  },
+  fx_and_cost_basis_partial: {
+    zh: '汇率与成本基础为部分口径',
+    en: 'FX and cost basis are partial',
+  },
+  sector_and_risk_metrics_limited: {
+    zh: '行业与风险指标覆盖有限',
+    en: 'Sector and risk metrics are limited',
+  },
 };
 
 type PendingDelete =
@@ -111,8 +129,12 @@ function isNewerSignal(left: DecisionSignalItem | undefined, right: DecisionSign
   return getSignalTime(right) > getSignalTime(left);
 }
 
-const DECISION_SIGNAL_MARKETS = new Set<DecisionSignalMarket>(['cn', 'hk', 'us', 'jp', 'kr']);
-type PortfolioAccountMarket = 'cn' | 'hk' | 'us' | 'jp' | 'kr';
+function formatPortfolioLimitation(limitation: string, language: PortfolioPageLanguage): string {
+  return PORTFOLIO_LIMITATION_LABELS[limitation]?.[language] ?? limitation;
+}
+
+const DECISION_SIGNAL_MARKETS = new Set<DecisionSignalMarket>(['cn', 'hk', 'us', 'jp', 'kr', 'tw']);
+type PortfolioAccountMarket = 'cn' | 'hk' | 'us' | 'jp' | 'kr' | 'tw';
 
 function toDecisionSignalMarket(value: string | null | undefined): DecisionSignalMarket | undefined {
   const normalized = String(value || '').toLowerCase();
@@ -160,6 +182,7 @@ async function loadPortfolioSignalLookup(lookup: PortfolioSignalLookup): Promise
 const PortfolioPage: React.FC = () => {
   const { language, t } = useUiLanguage();
   const text = PORTFOLIO_TEXT[language];
+  const decisionActionLabels = useMemo(() => buildDecisionActionLabelMap(t), [t]);
 
   // Set page title
   useEffect(() => {
@@ -914,6 +937,20 @@ const PortfolioPage: React.FC = () => {
   };
 
   const decisionSignalRiskPreviewItems = (risk?.decisionSignalRisk?.items ?? []).slice(0, 3);
+  const formatDecisionSignalRiskAction = (signal: Partial<DecisionSignalItem>): string => (
+    getDecisionActionLabel(
+      signal.action,
+      signal.actionLabel,
+      null,
+      text.alert,
+      decisionActionLabels,
+    ) ?? text.alert
+  );
+  const snapshotQualityMessage = snapshot?.dataQuality === 'partial' && snapshot.limitations?.length
+    ? snapshot.limitations
+      .map((limitation) => formatPortfolioLimitation(limitation, language))
+      .join(language === 'en' ? '; ' : '；')
+    : null;
 
   return (
     <div className="portfolio-page min-h-screen space-y-4 p-4 md:p-6">
@@ -1081,12 +1118,22 @@ const PortfolioPage: React.FC = () => {
               <option value="us">市场：美股（us）</option>
               <option value="jp">市场：日股（jp）</option>
               <option value="kr">市场：韩股（kr）</option>
+              <option value="tw">市场：台股（tw）</option>
             </select>
             <button type="submit" className="btn-secondary text-sm" disabled={accountCreating}>
               {accountCreating ? '创建中...' : '创建账户'}
             </button>
           </form>
         </Card>
+      ) : null}
+
+      {snapshotQualityMessage ? (
+        <InlineAlert
+          variant="warning"
+          title={text.snapshotPartialTitle}
+          message={snapshotQualityMessage}
+          className="rounded-xl px-3 py-2 text-xs shadow-none"
+        />
       ) : null}
 
       <section className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3">
@@ -1306,7 +1353,7 @@ const PortfolioPage: React.FC = () => {
                   <div className="space-y-1 pt-1">
                     {decisionSignalRiskPreviewItems.map((item) => (
                       <div key={`${item.accountId ?? 'all'}-${item.market}-${item.symbol}-${item.signal.id ?? item.signal.action}`} className="truncate text-foreground">
-                        {item.symbol} · {item.signal.actionLabel || item.signal.action || text.alert}
+                        {item.symbol} · {formatDecisionSignalRiskAction(item.signal)}
                       </div>
                     ))}
                   </div>
